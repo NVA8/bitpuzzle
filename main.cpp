@@ -17,6 +17,7 @@
 
 
 #include <sstream> 
+#include <algorithm>
 #include "Timer.h"
 #include "Vanity.h"
 #include "SECP256k1.h"
@@ -76,16 +77,16 @@ void setTerminalRawMode(bool enable) {
 void setNonBlockingInput(bool enable) {
 	int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
 	if (enable) {
-		fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Modalità non bloccante
+		fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); // Modalit non bloccante
 	}
 	else {
-		fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK); // Ripristina modalità bloccante
+		fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK); // Ripristina modalit bloccante
 	}
 }
 
 void monitorKeypress() {
 	setTerminalRawMode(true);
-	setNonBlockingInput(true);  // Imposta stdin in modalità non bloccante
+	setNonBlockingInput(true);  // Imposta stdin in modalit non bloccante
 
 	while (!stopMonitorKey) {
 		Timer::SleepMillis(1);
@@ -97,7 +98,7 @@ void monitorKeypress() {
 		}
 	}
 
-	setNonBlockingInput(false);  // Ripristina modalità normale
+	setNonBlockingInput(false);  // Ripristina modalit normale
 	setTerminalRawMode(false);
 }
 #endif
@@ -111,17 +112,21 @@ using namespace std;
 
 void printUsage() {
 
-	printf("VanitySeacrh [-v] [-gpuId] [-i inputfile] [-o outputfile] [-start HEX] [-range] [-m] [-stop] [-random]\n \n");
+	printf("VanitySeacrh [-v] [-gpuId] [-i inputfile] [-o outputfile] [-start HEX] [-range] [-rangesfile file] [-m] [-stop] [-random]\n \n");
 	printf(" -v: Print version\n");
 	printf(" -i inputfile: Get list of addresses to search from specified file\n");
 	printf(" -o outputfile: Output results to the specified file\n");
 	printf(" -gpuId: GPU to use, default is 0\n");
 	printf(" -start start Private Key HEX\n");
 	printf(" -range bit range dimension. start -> (start + 2^range).\n");
+	printf(" -rangesfile file containing list of ranges (one per line, start:+range or start:end)\n");
+	printf(" -randomseedsfile file with starting private keys for random search (hex per line)\n");
+	printf(" -seedrangebits bit-size of window around each seed (default 20, used with -randomseedsfile)\n");
 	printf(" -m: Max number of prefixes found by each kernel call, default is 262144 (use multiple of 65536)\n");
 	printf(" -stop: Stop when all prefixes are found\n");
 	printf(" -random: Random mode active. Each GPU thread scan 1024 random sequentally keys at each step. Not active by default\n");
 	printf(" -backup: Backup mode allows resuming from the progress percentage of the last sequential search. It does not work with random mode. \n");
+	printf(" -rangetime minutes to spend per range before switching to the next (only with -rangesfile or -randomseedsfile)\n");
 	exit(-1);
 
 }
@@ -321,6 +326,77 @@ void parseFile(string fileName, vector<string>& lines) {
 
 	if (loaddingProgress)
 		fprintf(stdout, "[Loading input file 100.0%%]\n");
+}
+
+void loadRangesFile(const std::string& fileName, std::vector<BITCRACK_PARAM>& ranges, Int& maxKey) {
+
+	std::ifstream inFile(fileName);
+	if (!inFile.is_open()) {
+		fprintf(stderr, "[ERROR] cannot open ranges file %s\n", fileName.c_str());
+		exit(-1);
+	}
+
+	std::string line;
+	size_t lineNum = 0;
+	while (std::getline(inFile, line)) {
+		lineNum++;
+
+		// Trim whitespace
+		line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+		if (line.empty() || line[0] == '#')
+			continue;
+
+		BITCRACK_PARAM r;
+		getKeySpace(line, &r, maxKey);
+		r.ksNext.Set(&r.ksStart);
+		checkKeySpace(&r, maxKey);
+		ranges.push_back(r);
+	}
+
+	if (ranges.empty()) {
+		fprintf(stderr, "[ERROR] ranges file %s is empty or invalid\n", fileName.c_str());
+		exit(-1);
+	}
+}
+
+
+void loadRandomSeedsFile(const std::string& fileName, std::vector<Int>& seeds) {
+
+    std::ifstream inFile(fileName);
+    if (!inFile.is_open()) {
+        fprintf(stderr, "[ERROR] cannot open random seeds file %s
+", fileName.c_str());
+        exit(-1);
+    }
+
+    std::string line;
+    while (std::getline(inFile, line)) {
+        // Trim whitespace
+        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+        if (line.empty() || line[0] == '#')
+            continue;
+
+        if (line.size() > 64) {
+            fprintf(stderr, "[ERROR] invalid seed length in %s
+", fileName.c_str());
+            exit(-1);
+        }
+        std::string hex = line;
+        hex.insert(0, 64 - hex.length(), '0');
+        Int v;
+        for (int i = 0; i < 32; i++) {
+            unsigned char b = 0;
+            sscanf(&hex[2 * i], "%02hhX", &b);
+            v.SetByte(31 - i, b);
+        }
+        seeds.push_back(v);
+    }
+
+    if (seeds.empty()) {
+        fprintf(stderr, "[ERROR] random seeds file %s is empty or invalid
+", fileName.c_str());
+        exit(-1);
+    }
 }
 
 void generateKeyPair(Secp256K1* secp, string seed, int searchMode, bool paranoiacSeed) {
@@ -561,6 +637,14 @@ int main(int argc, char* argv[]) {
 	uint32_t maxFound = 65536*4;
 	int range = 30;
 	string start = "0";
+	string rangesFile = "";
+	std::vector<BITCRACK_PARAM> rangesFromFile;
+	bool useRangeFile = false;
+	double rangeTimeLimitSec = 0.0;
+	std::string randomSeedsFile = "";
+	std::vector<Int> randomSeeds;
+	bool useRandomSeeds = false;
+	int seedRangeBits = 20;
 	
 	// bitcrack mod
 	BITCRACK_PARAM bitcrack, *bc;
@@ -613,7 +697,30 @@ int main(int argc, char* argv[]) {
 			backupMode = true;
 			a++;
 		}
-		else if (strcmp(argv[a], "-range") == 0) {
+	else if (strcmp(argv[a], "-rangesfile") == 0) {
+		a++;
+		rangesFile = string(argv[a]);
+		useRangeFile = true;
+		a++;
+	}
+	else if (strcmp(argv[a], "-rangetime") == 0) {
+		a++;
+		rangeTimeLimitSec = atof(argv[a]) * 60.0;
+		a++;
+	}
+	else if (strcmp(argv[a], "-randomseedsfile") == 0) {
+		a++;
+		randomSeedsFile = string(argv[a]);
+		useRandomSeeds = true;
+		a++;
+	}
+	else if (strcmp(argv[a], "-seedrangebits") == 0) {
+		a++;
+		seedRangeBits = getInt("seedrangebits", argv[a]);
+		a++;
+	}
+
+	else if (strcmp(argv[a], "-range") == 0) {
 			a++;
 			range = (uint64_t)getInt("range", argv[a]);
 			a++;
@@ -656,53 +763,77 @@ int main(int argc, char* argv[]) {
 	if (range > 255)
 		range = 255;
 
-	Int Range;
-	Range.SetInt32(1);
-
-	for (int i = 0; i < range; i++) {
-		Range.Mult(2);
+	if (useRandomSeeds) {
+		loadRandomSeedsFile(randomSeedsFile, randomSeeds);
 	}
-	Range.SubOne();
+	else if (useRangeFile) {
+		loadRangesFile(rangesFile, rangesFromFile, maxKey);
+		bc->ksStart.Set(&rangesFromFile[0].ksStart);
+		bc->ksFinish.Set(&rangesFromFile[0].ksFinish);
+		bc->ksNext.Set(&bc->ksStart);
+	}
+	else {
+		Int Range;
+		Range.SetInt32(1);
 
-	getKeySpace(string(start + ":+" + Range.GetBase16()), bc, maxKey);
-	bc->ksNext.Set(&bc->ksStart);
+		for (int i = 0; i < range; i++) {
+			Range.Mult(2);
+		}
+		Range.SubOne();
+
+		getKeySpace(string(start + ":+" + Range.GetBase16()), bc, maxKey);
+		bc->ksNext.Set(&bc->ksStart);
+	}
+
 	checkKeySpace(bc, maxKey);
 
 
 	{
 
-		fprintf(stdout, "[keyspace]  range=2^%d\n", range);
-		fprintf(stdout, "[keyspace]  start=%s\n", bc->ksStart.GetBase16().c_str());
-		fprintf(stdout, "[keyspace]    end=%s\n", bc->ksFinish.GetBase16().c_str());
+		if (useRangeFile) {
+			fprintf(stdout, "[keyspace]  ranges from %s (count=%zu)
+", rangesFile.c_str(), rangesFromFile.size());
+		}
+		else {
+			fprintf(stdout, "[keyspace]  range=2^%d
+", range);
+		}
+		fprintf(stdout, "[keyspace]  start=%s
+", bc->ksStart.GetBase16().c_str());
+		fprintf(stdout, "[keyspace]    end=%s
+", bc->ksFinish.GetBase16().c_str());
 		if (randomMode) {
-			fprintf(stdout, "Random Mode Enabled !\n");
+			fprintf(stdout, "Random Mode Enabled !
+");
 		}
 		fflush(stdout);
 
 
 		idxcount = 0;
-		t_Paused = 0;
+		t_Paused = 0;		
 		Pause = false;
 
 		if (backupMode) {
 			loadBackup(idxcount, t_Paused, gpuId[0]);
-			fprintf(stdout, "Backup enabled ! \n");
+			fprintf(stdout, "Backup enabled ! 
+");
 		}
 	repeatP:
 		Paused = false;
-		VanitySearch* v = new VanitySearch(secp, address, searchMode, stop, outputFile, maxFound, bc);
+		VanitySearch* v = new VanitySearch(secp, address, searchMode, stop, outputFile, maxFound, bc, rangeTimeLimitSec, useRangeFile ? &rangesFromFile : nullptr);
 		v->Search(gpuId, gridSize);
 
 		while (Paused) {
 			Timer::SleepMillis(100);
 			if (!Pause) {
-				fprintf(stdout, "\nResuming...\n");
+				fprintf(stdout, "
+Resuming...
+");
 				goto repeatP;
 				
 			}
 		}
 	}
-
 	stopMonitorKey = true;
 
 	Timer::SleepMillis(100);

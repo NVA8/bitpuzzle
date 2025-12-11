@@ -92,7 +92,11 @@ class VanitySearch {
 public:
 
 	VanitySearch(Secp256K1* secp, std::vector<std::string>& address, int searchMode,
-		bool stop, std::string outputFile, uint32_t maxFound, BITCRACK_PARAM* bc);
+		bool stop, std::string outputFile, uint32_t maxFound, BITCRACK_PARAM* bc,
+		double rangeTimeLimitSec = 0.0,
+		std::vector<BITCRACK_PARAM>* ranges = nullptr,
+		std::vector<Int>* randomSeeds = nullptr,
+		Int seedRangeMask = Int());
 
 	void Search(std::vector<int> gpuId, std::vector<int> gridSize);
 	void FindKeyGPU(TH_PARAM* p);
@@ -102,6 +106,7 @@ private:
 	std::string GetHex(std::vector<unsigned char>& buffer);
 	std::string GetExpectedTimeBitCrack(double keyRate, double keyCount, BITCRACK_PARAM* bc);
 	bool checkPrivKey(std::string addr, Int& key, int32_t incr, int endomorphism, bool mode);
+	bool loadRange(size_t idx);
 	void checkAddr(int prefIdx, uint8_t* hash160, Int& key, int32_t incr, int endomorphism, bool mode);
 	void checkAddrSSE(uint8_t* h1, uint8_t* h2, uint8_t* h3, uint8_t* h4,
 		int32_t incr1, int32_t incr2, int32_t incr3, int32_t incr4,
@@ -150,6 +155,14 @@ private:
 	std::vector<std::string>& inputAddresses;	
 
 	BITCRACK_PARAM* bc;
+	std::vector<BITCRACK_PARAM>* ranges;
+	size_t currentRangeIdx;
+	bool multiRangeMode;
+	bool useRandomSeeds;
+	std::vector<Int>* randomSeeds;
+	Int seedRangeMask;
+	size_t currentSeedIdx;
+	double rangeTimeLimitSec;
 	void saveProgress(TH_PARAM* p, Int& lastSaveKey, BITCRACK_PARAM* bc);
 
 	Int firstGPUThreadLastPrivateKey;

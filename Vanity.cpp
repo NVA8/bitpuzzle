@@ -43,7 +43,7 @@ using namespace std;
 //Point _2Gn;
 
 VanitySearch::VanitySearch(Secp256K1* secp, vector<std::string>& inputAddresses, int searchMode,
-	bool stop, string outputFile, uint32_t maxFound, BITCRACK_PARAM* bc):inputAddresses(inputAddresses) 
+	bool stop, string outputFile, uint32_t maxFound, BITCRACK_PARAM* bc, double rangeTimeLimitSec, vector<BITCRACK_PARAM>* ranges, vector<Int>* randomSeeds, Int seedRangeMask) :inputAddresses(inputAddresses)
 {
 	this->secp = secp;
 	this->searchMode = searchMode;
@@ -52,7 +52,19 @@ VanitySearch::VanitySearch(Secp256K1* secp, vector<std::string>& inputAddresses,
 	this->numGPUs = 0;
 	this->maxFound = maxFound;	
 	this->searchType = -1;
-	this->bc = bc;	
+	this->bc = bc;
+	this->ranges = ranges;
+	this->currentRangeIdx = 0;
+	this->multiRangeMode = (ranges != NULL && ranges->size() > 0) || (randomSeeds != NULL && randomSeeds->size() > 0);
+	this->rangeTimeLimitSec = rangeTimeLimitSec;
+	this->randomSeeds = randomSeeds;
+	this->useRandomSeeds = (randomSeeds != NULL && randomSeeds->size() > 0);
+	this->seedRangeMask = seedRangeMask;
+	this->currentSeedIdx = 0;
+
+	if (multiRangeMode) {
+		loadRange(0);
+	}
 
 	rseed(static_cast<unsigned long>(time(NULL)));
 	
@@ -193,6 +205,33 @@ VanitySearch::VanitySearch(Secp256K1* secp, vector<std::string>& inputAddresses,
 	ctimeBuff = ctime(&now);
 	fprintf(stdout, "Current task START time: %s", ctimeBuff);
 	fflush(stdout);
+}
+
+bool VanitySearch::loadRange(size_t idx) {
+
+	if (!multiRangeMode)
+		return false;
+
+	if (useRandomSeeds) {
+		if (randomSeeds == NULL || randomSeeds->size() == 0)
+			return false;
+		currentSeedIdx = idx % randomSeeds->size();
+		bc->ksStart.Set(&(*randomSeeds)[currentSeedIdx]);
+		// ksFinish = ksStart + seedRangeMask (e.g. 2^seedRangeBits - 1)
+		bc->ksFinish.Set(&bc->ksStart);
+		bc->ksFinish.Add(&seedRangeMask);
+		bc->ksNext.Set(&bc->ksStart);
+		return true;
+	}
+
+	if (ranges == NULL || idx >= ranges->size())
+		return false;
+
+	bc->ksStart.Set(&(*ranges)[idx].ksStart);
+	bc->ksFinish.Set(&(*ranges)[idx].ksFinish);
+	bc->ksNext.Set(&bc->ksStart);
+
+	return true;
 }
 
 bool VanitySearch::isSingularAddress(std::string pref) {
@@ -887,8 +926,8 @@ void VanitySearch::FindKeyGPU(TH_PARAM* ph) {
 	double t0;
 	double ttot;
 	uint64_t keys_n = 0;
-	static uint64_t keys_n_prev = 0;
-	static double tprev = 0.0;
+	uint64_t keys_n_prev = 0;
+	double tprev = 0.0;
 
 	// Global init
 	int thId = ph->threadId;
@@ -902,9 +941,6 @@ void VanitySearch::FindKeyGPU(TH_PARAM* ph) {
 	Int RandomJump_K;
 	Int RandomJump_K_last;
 	Int RandomJump_K_tot;
-	RandomJump_K.SetInt32(STEP_SIZE);
-	RandomJump_K_last.SetInt32(0);
-	RandomJump_K_tot.SetInt32(0);
 	bool kneg = false;
 
 	fprintf(stdout, "GPU: %s\n", g.deviceName.c_str());
@@ -925,152 +961,195 @@ void VanitySearch::FindKeyGPU(TH_PARAM* ph) {
 	Int taskSize;
 	Int numthread;
 
-	taskSize.Set(&bc->ksFinish);
-	taskSize.Sub(&bc->ksStart);
-	taskSize.AddOne();
-	numthread.SetInt32(numThreadsGPU);
-	stepThread.Set(&taskSize);
-	stepThread.Div(&numthread);
+	auto resetRandomJump = [&]() {
+		RandomJump_K.SetInt32(STEP_SIZE);
+		RandomJump_K_last.SetInt32(0);
+		RandomJump_K_tot.SetInt32(0);
+	};
+
+	auto configureRange = [&](uint64_t progress) -> bool {
+
+		taskSize.Set(&bc->ksFinish);
+		taskSize.Sub(&bc->ksStart);
+		taskSize.AddOne();
+		numthread.SetInt32(numThreadsGPU);
+		stepThread.Set(&taskSize);
+		stepThread.Div(&numthread);
+
+		getGPUStartingKeys(bc->ksStart, bc->ksFinish, g.GetGroupSize(), numThreadsGPU, publicKeys, progress);
+		return g.SetKeys(publicKeys);
+	};
 
 	Int privkey;
 	Int part_key;
 	Int keycount;
+	double rangeStartTick = 0.0;
 
-	t0 = Timer::get_tick();
+	size_t totalRanges = multiRangeMode ? ranges->size() : 1;
 
-	getGPUStartingKeys(bc->ksStart, bc->ksFinish, g.GetGroupSize(), numThreadsGPU, publicKeys, (uint64_t)(1ULL * idxcount * g.GetStepSize()));
+	do {
 
-	ok = g.SetKeys(publicKeys);
-	delete[] publicKeys;
+		keys_n = 0;
+		keys_n_prev = 0;
+		tprev = 0.0;
+		idxcount = 0;
+		t_Paused = 0;
+		Pause = false;
+		resetRandomJump();
 
-	ttot = Timer::get_tick() - t0;
+		t0 = Timer::get_tick();
+		ok = configureRange(0);
+		if (!ok) {
+			break;
+		}
+		rangeStartTick = t0;
+		ttot = Timer::get_tick() - t0;
 
+		printf("Starting keys set in %.2f seconds (range %zu/%zu) \n", ttot, currentRangeIdx + 1, totalRanges);
+		fflush(stdout);
 
-	printf("Starting keys set in %.2f seconds \n", ttot);
-	fflush(stdout);
+		if (!ph->hasStarted) {
+			ph->hasStarted = true;
+			printf("GPU Started ! \r");
+			fflush(stdout);
+		}
 
-	ph->hasStarted = true;
-
-	printf("GPU Started ! \r");
-	fflush(stdout);
-
-	t0 = Timer::get_tick();
-
-	endOfSearch = false;
-
-
-	while (ok && !endOfSearch) {
-
-		if (!Pause) {	
-
-
-			if (randomMode) {
-				RandomJump_K_last.Set(&RandomJump_K);
-				RandomJump_K_tot.Add(&RandomJump_K);
-
-				RandomJump_K.Rand(256);
-				RandomJump_K.Mod(&stepThread);
-				RandomJump_K.Sub(&RandomJump_K_tot);
-				
-				if (RandomJump_K.IsNegative()) {
-					RandomJump_K.Neg();
-					RandomJump_P = secp->ComputePublicKey(&RandomJump_K);
-					RandomJump_P.y.ModNeg();
-					RandomJump_K.Neg();
-				}
-				else {
-					RandomJump_P = secp->ComputePublicKey(&RandomJump_K);
-				}
-				
-				ok = g.SetRandomJump(RandomJump_P);
-			}
-
-			ok = g.Launch(found, true);
-			idxcount += 1;
-
-			if (!randomMode && idxcount%60==0) {
-				
-				saveBackup(idxcount, ttot, ph->gpuId);
-			}
-			//printf("\n rnd: %s  idx:  %d \n", RandomJump_K_tot.GetBase10().c_str(), idxcount);
-
-			ttot = Timer::get_tick() - t0 + t_Paused;
-
-			keycount.SetInt32(idxcount - 1);
-			keycount.Mult(STEP_SIZE);
+		t0 = Timer::get_tick();
+		endOfSearch = false;
+		keycount.SetInt32(0);
 
 
-			for (int i = 0; i < (int)found.size() && !endOfSearch; i++) {
+		while (ok && !endOfSearch) {
 
-				ITEM it = found[i];
-				part_key.Set(&stepThread);
-				part_key.Mult(it.thId);
-	
-				privkey.Set(&bc->ksStart);
-				privkey.Add(&part_key);
+			bool rangeFinished = false;
+
+			if (!Pause) {
+
 
 				if (randomMode) {
-					privkey.Add(&RandomJump_K_tot);
-					privkey.Sub(&RandomJump_K_last);
+					RandomJump_K_last.Set(&RandomJump_K);
+					RandomJump_K_tot.Add(&RandomJump_K);
+
+					RandomJump_K.Rand(256);
+					RandomJump_K.Mod(&stepThread);
+					RandomJump_K.Sub(&RandomJump_K_tot);
+
+					if (RandomJump_K.IsNegative()) {
+						RandomJump_K.Neg();
+						RandomJump_P = secp->ComputePublicKey(&RandomJump_K);
+						RandomJump_P.y.ModNeg();
+						RandomJump_K.Neg();
+					}
+					else {
+						RandomJump_P = secp->ComputePublicKey(&RandomJump_K);
+					}
+
+					ok = g.SetRandomJump(RandomJump_P);
 				}
-				else {				
-					privkey.Add(&keycount);
+
+				ok = g.Launch(found, true);
+				idxcount += 1;
+
+				if (!randomMode && idxcount % 60 == 0) {
+
+					saveBackup(idxcount, ttot, ph->gpuId);
 				}
-			
-				checkAddr(*(address_t*)(it.hash), it.hash, privkey, it.incr, it.endo, it.mode);
+				//printf("\n rnd: %s  idx:  %d \n", RandomJump_K_tot.GetBase10().c_str(), idxcount);
+
+				ttot = Timer::get_tick() - t0 + t_Paused;
+
+				keycount.SetInt32(idxcount - 1);
+				keycount.Mult(STEP_SIZE);
+
+
+				for (int i = 0; i < (int)found.size() && !endOfSearch; i++) {
+
+					ITEM it = found[i];
+					part_key.Set(&stepThread);
+					part_key.Mult(it.thId);
+
+					privkey.Set(&bc->ksStart);
+					privkey.Add(&part_key);
+
+					if (randomMode) {
+						privkey.Add(&RandomJump_K_tot);
+						privkey.Sub(&RandomJump_K_last);
+					}
+					else {
+						privkey.Add(&keycount);
+					}
+
+					checkAddr(*(address_t*)(it.hash), it.hash, privkey, it.incr, it.endo, it.mode);
+				}
+
+				keycount.Add(STEP_SIZE);
+				keycount.Mult(numThreadsGPU);
+
+				keys_n = 1ULL * STEP_SIZE * numThreadsGPU;
+				keys_n = keys_n * idxcount;
+
+
+
+
+			}
+			else {
+				printf("Pausing...\r");
+				fflush(stdout);
+
+				g.FreeGPUEngine();
+
+				Paused = true;
+				t_Paused = ttot;
 			}
 
-			keycount.Add(STEP_SIZE);
-			keycount.Mult(numThreadsGPU);
 
-			keys_n = 1ULL * STEP_SIZE * numThreadsGPU;
-			keys_n = keys_n * idxcount;
-		
-			
+			PrintStats(keys_n, keys_n_prev, ttot, tprev, taskSize, keycount);
 
-			
 
-		} else {
-			printf("Pausing...\r");
-			fflush(stdout);
 
-			g.FreeGPUEngine();
+			if ((rangeTimeLimitSec > 0.0 && (Timer::get_tick() - rangeStartTick) >= rangeTimeLimitSec) ||
+				(keycount.IsGreaterOrEqual(&taskSize) && (!randomMode || multiRangeMode)))
+			{
+				double avg_speed = static_cast<double>(keys_n) / (ttot * 1000000.0); // Avg speed in MK/s
+				printf("\n");
+				printf("Range Finished! - Average Speed: %.1f [MK/s] - Found: %d   \r", avg_speed, nbFoundKey);
+				printf("\n");
+				fflush(stdout);
 
-			Paused = true;
-			t_Paused = ttot;
+				char* ctimeBuff;
+				time_t now = time(NULL);
+				ctimeBuff = ctime(&now);
+				printf("Current task END time: %s", ctimeBuff);
+
+				rangeFinished = true;
+
+
+
+			}
+
+			keys_n_prev = keys_n;
+			tprev = ttot;
+
+			if (rangeFinished) {
+				break;
+			}
+
 		}
-		
 
-		PrintStats(keys_n, keys_n_prev, ttot, tprev, taskSize, keycount);
 
-		
 
-		if (keycount.IsGreaterOrEqual(&taskSize) && (!randomMode))
-		{
-			double avg_speed = static_cast<double>(keys_n) / (ttot * 1000000.0); // Avg speed in MK/s
-			printf("\n");
-			printf("Range Finished! - Average Speed: %.1f [MK/s] - Found: %d   \r", avg_speed, nbFoundKey);
-			printf("\n");
-			fflush(stdout);
-
-			char* ctimeBuff;
-			time_t now = time(NULL);
-			ctimeBuff = ctime(&now);
-			printf("Current task END time: %s", ctimeBuff);
-
+		if (multiRangeMode) {
+			// Round-robin through ranges to time-slice search.
+			currentRangeIdx = (currentRangeIdx + 1) % totalRanges;
+			loadRange(currentRangeIdx);
+		}
+		else {
 			endOfSearch = true;
-
-			
-
 		}
 
-		keys_n_prev = keys_n;
-		tprev = ttot ;
+	} while (ok && !endOfSearch);
 
-	}
-
-
-	
+	delete[] publicKeys;
 
 	ph->isRunning = false;
 
