@@ -23,6 +23,7 @@
 #include "SECP256k1.h"
 #include <fstream>
 #include <string>
+#include <cstdlib>
 #include <string.h>
 #include <stdexcept>
 #include "hash/sha512.h"
@@ -364,8 +365,7 @@ void loadRandomSeedsFile(const std::string& fileName, std::vector<Int>& seeds) {
 
     std::ifstream inFile(fileName);
     if (!inFile.is_open()) {
-        fprintf(stderr, "[ERROR] cannot open random seeds file %s
-", fileName.c_str());
+        fprintf(stderr, "[ERROR] cannot open random seeds file %s\n", fileName.c_str());
         exit(-1);
     }
 
@@ -377,8 +377,7 @@ void loadRandomSeedsFile(const std::string& fileName, std::vector<Int>& seeds) {
             continue;
 
         if (line.size() > 64) {
-            fprintf(stderr, "[ERROR] invalid seed length in %s
-", fileName.c_str());
+            fprintf(stderr, "[ERROR] invalid seed length in %s\n", fileName.c_str());
             exit(-1);
         }
         std::string hex = line;
@@ -393,8 +392,7 @@ void loadRandomSeedsFile(const std::string& fileName, std::vector<Int>& seeds) {
     }
 
     if (seeds.empty()) {
-        fprintf(stderr, "[ERROR] random seeds file %s is empty or invalid
-", fileName.c_str());
+        fprintf(stderr, "[ERROR] random seeds file %s is empty or invalid\n", fileName.c_str());
         exit(-1);
     }
 }
@@ -645,6 +643,7 @@ int main(int argc, char* argv[]) {
 	std::vector<Int> randomSeeds;
 	bool useRandomSeeds = false;
 	int seedRangeBits = 20;
+	Int seedRangeMask;
 	
 	// bitcrack mod
 	BITCRACK_PARAM bitcrack, *bc;
@@ -765,6 +764,15 @@ int main(int argc, char* argv[]) {
 
 	if (useRandomSeeds) {
 		loadRandomSeedsFile(randomSeedsFile, randomSeeds);
+		seedRangeMask.SetInt32(1);
+		for (int i = 0; i < seedRangeBits; i++) {
+			seedRangeMask.Mult(2);
+		}
+		seedRangeMask.SubOne();
+		bc->ksStart.Set(&randomSeeds[0]);
+		bc->ksFinish.Set(&randomSeeds[0]);
+		bc->ksFinish.Add(&seedRangeMask);
+		bc->ksNext.Set(&bc->ksStart);
 	}
 	else if (useRangeFile) {
 		loadRangesFile(rangesFile, rangesFromFile, maxKey);
@@ -790,21 +798,19 @@ int main(int argc, char* argv[]) {
 
 	{
 
-		if (useRangeFile) {
-			fprintf(stdout, "[keyspace]  ranges from %s (count=%zu)
-", rangesFile.c_str(), rangesFromFile.size());
+		if (useRandomSeeds) {
+			fprintf(stdout, "[keyspace]  random seeds from %s (count=%zu)\n", randomSeedsFile.c_str(), randomSeeds.size());
+		}
+		else if (useRangeFile) {
+			fprintf(stdout, "[keyspace]  ranges from %s (count=%zu)\n", rangesFile.c_str(), rangesFromFile.size());
 		}
 		else {
-			fprintf(stdout, "[keyspace]  range=2^%d
-", range);
+			fprintf(stdout, "[keyspace]  range=2^%d\n", range);
 		}
-		fprintf(stdout, "[keyspace]  start=%s
-", bc->ksStart.GetBase16().c_str());
-		fprintf(stdout, "[keyspace]    end=%s
-", bc->ksFinish.GetBase16().c_str());
+		fprintf(stdout, "[keyspace]  start=%s\n", bc->ksStart.GetBase16().c_str());
+		fprintf(stdout, "[keyspace]    end=%s\n", bc->ksFinish.GetBase16().c_str());
 		if (randomMode) {
-			fprintf(stdout, "Random Mode Enabled !
-");
+			fprintf(stdout, "Random Mode Enabled !\n");
 		}
 		fflush(stdout);
 
@@ -815,20 +821,17 @@ int main(int argc, char* argv[]) {
 
 		if (backupMode) {
 			loadBackup(idxcount, t_Paused, gpuId[0]);
-			fprintf(stdout, "Backup enabled ! 
-");
+			fprintf(stdout, "Backup enabled ! \n");
 		}
 	repeatP:
 		Paused = false;
-		VanitySearch* v = new VanitySearch(secp, address, searchMode, stop, outputFile, maxFound, bc, rangeTimeLimitSec, useRangeFile ? &rangesFromFile : nullptr);
+		VanitySearch* v = new VanitySearch(secp, address, searchMode, stop, outputFile, maxFound, bc, rangeTimeLimitSec, useRangeFile ? &rangesFromFile : nullptr, useRandomSeeds ? &randomSeeds : nullptr, seedRangeMask);
 		v->Search(gpuId, gridSize);
 
 		while (Paused) {
 			Timer::SleepMillis(100);
 			if (!Pause) {
-				fprintf(stdout, "
-Resuming...
-");
+				fprintf(stdout, "\nResuming...\n");
 				goto repeatP;
 				
 			}
